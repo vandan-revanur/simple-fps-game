@@ -1,0 +1,15 @@
+[package]
+name = "simple-quake"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+wgpu = "0.19"
+winit = "0.30"
+cgmath = "0.18"
+bytemuck = "1.15"
+env_logger = "0.11"
+pollster = "0.4"
+
+[profile.dev]
+opt-level = 0
