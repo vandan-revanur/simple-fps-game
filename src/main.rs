@@ -1,15 +1,27 @@
 use std::sync::Arc;
 
-use cgmath::{perspective, Deg, EuclideanSpace, Matrix4, Point3, SquareMatrix, Vector3};
+use cgmath::{perspective, Deg, EuclideanSpace, InnerSpace, Matrix4, Point3, Vector3};
 use wgpu::util::DeviceExt;
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, KeyEvent, WindowEvent};
+use winit::event::{ElementState, KeyEvent, MouseButton, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 const WINDOW_WIDTH: u32 = 1280;
 const WINDOW_HEIGHT: u32 = 720;
+
+#[derive(Clone)]
+struct Enemy {
+    position: Vector3<f32>,
+    alive: bool,
+}
+
+struct Bullet {
+    position: Vector3<f32>,
+    direction: Vector3<f32>,
+    lifetime: f32,
+}
 
 struct Camera {
     position: Vector3<f32>,
@@ -49,6 +61,14 @@ impl Camera {
     fn get_view_projection(&self) -> Matrix4<f32> {
         self.get_projection_matrix() * self.get_view_matrix()
     }
+
+    fn get_forward_vector(&self) -> Vector3<f32> {
+        Vector3::new(
+            -self.yaw.sin() * self.pitch.cos(),
+            self.pitch.sin(),
+            -self.yaw.cos() * self.pitch.cos(),
+        )
+    }
 }
 
 struct Input {
@@ -56,6 +76,7 @@ struct Input {
     backward: bool,
     left: bool,
     right: bool,
+    shoot: bool,
     mouse_dx: f32,
     mouse_dy: f32,
     last_mouse_x: f64,
@@ -70,6 +91,7 @@ impl Input {
             backward: false,
             left: false,
             right: false,
+            shoot: false,
             mouse_dx: 0.0,
             mouse_dy: 0.0,
             last_mouse_x: 0.0,
@@ -92,6 +114,11 @@ struct App {
     camera_buffer: Option<wgpu::Buffer>,
     bind_group: Option<wgpu::BindGroup>,
     pipeline: Option<wgpu::RenderPipeline>,
+    enemies: Vec<Enemy>,
+    bullets: Vec<Bullet>,
+    ui_pipeline: Option<wgpu::RenderPipeline>,
+    ui_vertex_buffer: Option<wgpu::Buffer>,
+    ui_index_buffer: Option<wgpu::Buffer>,
 }
 
 impl App {
@@ -109,6 +136,14 @@ impl App {
             camera_buffer: None,
             bind_group: None,
             pipeline: None,
+            enemies: vec![Enemy {
+                position: Vector3::new(0.0, 1.0, -10.0),
+                alive: true,
+            }],
+            bullets: Vec::new(),
+            ui_pipeline: None,
+            ui_vertex_buffer: None,
+            ui_index_buffer: None,
         }
     }
 
@@ -116,14 +151,25 @@ impl App {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::default());
         let surface = instance.create_surface(window.clone()).unwrap();
 
-        let adapter =
-            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
-                .unwrap();
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            compatible_surface: Some(&surface),
+            force_fallback_adapter: false,
+        }))
+        .expect("Failed to find an appropriate adapter");
+
         let (device, queue) =
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default(), None))
                 .unwrap();
 
-        let format = surface.get_capabilities(&adapter).formats[0];
+        let surface_caps = surface.get_capabilities(&adapter);
+        let format = surface_caps
+            .formats
+            .iter()
+            .find(|f| f.is_srgb())
+            .copied()
+            .or_else(|| surface_caps.formats.first().copied())
+            .expect("No compatible surface format found");
 
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -198,20 +244,6 @@ impl App {
         });
 
         // Camera uniform as flat array
-        let camera_data = [0.0f32; 16];
-        let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Camera Buffer"),
-            contents: bytemuck::cast_slice(&camera_data),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-
-        let indices: Vec<u16> = (0..vertices.len() as u16).collect();
-        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Index Buffer"),
-            contents: bytemuck::cast_slice(&indices),
-            usage: wgpu::BufferUsages::INDEX,
-        });
-
         let camera_data = [0.0f32; 16];
         let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Camera Buffer"),
@@ -321,6 +353,120 @@ impl App {
             multiview: None,
         });
 
+        // Create UI pipeline for crosshairs and gun
+        let ui_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("UI Shader"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(
+                r#"
+                struct VertexInput {
+                    @location(0) position: vec2<f32>,
+                    @location(1) color: vec3<f32>,
+                }
+
+                struct VertexOutput {
+                    @builtin(position) clip_position: vec4<f32>,
+                    @location(0) color: vec3<f32>,
+                }
+
+                @vertex
+                fn vs_main(input: VertexInput) -> VertexOutput {
+                    var out: VertexOutput;
+                    out.clip_position = vec4<f32>(input.position, 0.0, 1.0);
+                    out.color = input.color;
+                    return out;
+                }
+
+                @fragment
+                fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+                    return vec4<f32>(input.color, 1.0);
+                }
+            "#,
+            )),
+        });
+
+        let ui_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("UI Pipeline Layout"),
+            bind_group_layouts: &[],
+            push_constant_ranges: &[],
+        });
+
+        let ui_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("UI Pipeline"),
+            layout: Some(&ui_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &ui_shader,
+                entry_point: "vs_main",
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: 20,
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &[
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x2,
+                            offset: 0,
+                            shader_location: 0,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x3,
+                            offset: 8,
+                            shader_location: 1,
+                        },
+                    ],
+                }],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::LineList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &ui_shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview: None,
+        });
+
+        // Crosshair vertices (screen space coordinates)
+        let ui_vertices: Vec<[f32; 5]> = vec![
+            // Crosshair - horizontal line
+            [-0.02, 0.0, 1.0, 1.0, 1.0],
+            [0.02, 0.0, 1.0, 1.0, 1.0],
+            // Crosshair - vertical line
+            [0.0, -0.02, 1.0, 1.0, 1.0],
+            [0.0, 0.02, 1.0, 1.0, 1.0],
+            // Gun rectangle (bottom right)
+            [0.7, -0.5, 0.3, 0.3, 0.3],
+            [0.9, -0.5, 0.3, 0.3, 0.3],
+            [0.9, -0.5, 0.3, 0.3, 0.3],
+            [0.9, -0.9, 0.3, 0.3, 0.3],
+            [0.9, -0.9, 0.3, 0.3, 0.3],
+            [0.7, -0.9, 0.3, 0.3, 0.3],
+            [0.7, -0.9, 0.3, 0.3, 0.3],
+            [0.7, -0.5, 0.3, 0.3, 0.3],
+            // Gun barrel
+            [0.75, -0.5, 0.5, 0.5, 0.5],
+            [0.75, -0.3, 0.5, 0.5, 0.5],
+        ];
+
+        let ui_vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("UI Vertex Buffer"),
+            contents: bytemuck::cast_slice(&ui_vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        let ui_indices: Vec<u16> = (0..ui_vertices.len() as u16).collect();
+        let ui_index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("UI Index Buffer"),
+            contents: bytemuck::cast_slice(&ui_indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+
+        // Now assign everything to self
         self.window = Some(window);
         self.device = Some(device);
         self.queue = Some(queue);
@@ -331,6 +477,9 @@ impl App {
         self.camera_buffer = Some(camera_buffer);
         self.bind_group = Some(bind_group);
         self.pipeline = Some(pipeline);
+        self.ui_pipeline = Some(ui_pipeline);
+        self.ui_vertex_buffer = Some(ui_vertex_buffer);
+        self.ui_index_buffer = Some(ui_index_buffer);
     }
 
     fn update(&mut self) {
@@ -354,12 +503,45 @@ impl App {
         }
 
         // Mouse look
-        self.camera.yaw += self.input.mouse_dx * 0.002;
-        self.camera.pitch += self.input.mouse_dy * 0.002;
+        self.camera.yaw -= self.input.mouse_dx * 0.002;  // Negative for natural mouse look
+        self.camera.pitch -= self.input.mouse_dy * 0.002;  // Negative for natural mouse look
         self.camera.pitch = self.camera.pitch.clamp(-1.5, 1.5);
 
         self.input.mouse_dx = 0.0;
         self.input.mouse_dy = 0.0;
+
+        // Shooting
+        if self.input.shoot {
+            let forward = self.camera.get_forward_vector().normalize();
+            self.bullets.push(Bullet {
+                position: self.camera.position,
+                direction: forward,
+                lifetime: 5.0,
+            });
+            self.input.shoot = false;
+        }
+
+        // Update bullets
+        let bullet_speed = 0.5;
+        self.bullets.retain_mut(|bullet| {
+            bullet.position += bullet.direction * bullet_speed;
+            bullet.lifetime -= 0.016; // Approximate frame time
+            bullet.lifetime > 0.0
+        });
+
+        // Check bullet-enemy collisions
+        for bullet in &self.bullets {
+            for enemy in &mut self.enemies {
+                if !enemy.alive {
+                    continue;
+                }
+                let dist = (bullet.position - enemy.position).magnitude();
+                if dist < 1.5 {
+                    enemy.alive = false;
+                    println!("Enemy destroyed!");
+                }
+            }
+        }
     }
 
     fn render(&mut self) {
@@ -369,8 +551,6 @@ impl App {
         let pipeline = self.pipeline.as_ref().unwrap();
         let bind_group = self.bind_group.as_ref().unwrap();
         let camera_buffer = self.camera_buffer.as_ref().unwrap();
-        let vertex_buffer = self.vertex_buffer.as_ref().unwrap();
-        let index_buffer = self.index_buffer.as_ref().unwrap();
 
         let vp = self.camera.get_view_projection();
         let vp_arr: [[f32; 4]; 4] = vp.into();
@@ -393,6 +573,128 @@ impl App {
             vp_arr[3][3],
         ];
         queue.write_buffer(camera_buffer, 0, bytemuck::cast_slice(&[vp_flat]));
+
+        // Build dynamic geometry for enemies and bullets
+        let mut vertices: Vec<[f32; 6]> = vec![
+            // Floor (blue) - large quad
+            [-50.0, 0.0, -50.0, 0.0, 0.0, 1.0],
+            [50.0, 0.0, -50.0, 0.0, 0.0, 1.0],
+            [50.0, 0.0, 50.0, 0.0, 0.0, 1.0],
+            [-50.0, 0.0, -50.0, 0.0, 0.0, 1.0],
+            [50.0, 0.0, 50.0, 0.0, 0.0, 1.0],
+            [-50.0, 0.0, 50.0, 0.0, 0.0, 1.0],
+        ];
+
+        // Add alive enemies
+        for enemy in &self.enemies {
+            if !enemy.alive {
+                continue;
+            }
+            let pos = enemy.position;
+            let enemy_verts = vec![
+                // Front
+                [pos.x - 1.0, pos.y - 1.0, pos.z + 1.0, 1.0, 0.0, 0.0],
+                [pos.x + 1.0, pos.y - 1.0, pos.z + 1.0, 1.0, 0.0, 0.0],
+                [pos.x + 1.0, pos.y + 1.0, pos.z + 1.0, 1.0, 0.0, 0.0],
+                [pos.x - 1.0, pos.y - 1.0, pos.z + 1.0, 1.0, 0.0, 0.0],
+                [pos.x + 1.0, pos.y + 1.0, pos.z + 1.0, 1.0, 0.0, 0.0],
+                [pos.x - 1.0, pos.y + 1.0, pos.z + 1.0, 1.0, 0.0, 0.0],
+                // Back
+                [pos.x - 1.0, pos.y - 1.0, pos.z - 1.0, 0.5, 0.0, 0.0],
+                [pos.x - 1.0, pos.y + 1.0, pos.z - 1.0, 0.5, 0.0, 0.0],
+                [pos.x + 1.0, pos.y + 1.0, pos.z - 1.0, 0.5, 0.0, 0.0],
+                [pos.x - 1.0, pos.y - 1.0, pos.z - 1.0, 0.5, 0.0, 0.0],
+                [pos.x + 1.0, pos.y + 1.0, pos.z - 1.0, 0.5, 0.0, 0.0],
+                [pos.x + 1.0, pos.y - 1.0, pos.z - 1.0, 0.5, 0.0, 0.0],
+                // Top
+                [pos.x - 1.0, pos.y + 1.0, pos.z + 1.0, 0.7, 0.0, 0.0],
+                [pos.x + 1.0, pos.y + 1.0, pos.z + 1.0, 0.7, 0.0, 0.0],
+                [pos.x + 1.0, pos.y + 1.0, pos.z - 1.0, 0.7, 0.0, 0.0],
+                [pos.x - 1.0, pos.y + 1.0, pos.z + 1.0, 0.7, 0.0, 0.0],
+                [pos.x + 1.0, pos.y + 1.0, pos.z - 1.0, 0.7, 0.0, 0.0],
+                [pos.x - 1.0, pos.y + 1.0, pos.z - 1.0, 0.7, 0.0, 0.0],
+                // Right
+                [pos.x + 1.0, pos.y - 1.0, pos.z + 1.0, 0.6, 0.0, 0.0],
+                [pos.x + 1.0, pos.y - 1.0, pos.z - 1.0, 0.6, 0.0, 0.0],
+                [pos.x + 1.0, pos.y + 1.0, pos.z - 1.0, 0.6, 0.0, 0.0],
+                [pos.x + 1.0, pos.y - 1.0, pos.z + 1.0, 0.6, 0.0, 0.0],
+                [pos.x + 1.0, pos.y + 1.0, pos.z - 1.0, 0.6, 0.0, 0.0],
+                [pos.x + 1.0, pos.y + 1.0, pos.z + 1.0, 0.6, 0.0, 0.0],
+                // Left
+                [pos.x - 1.0, pos.y - 1.0, pos.z - 1.0, 0.8, 0.0, 0.0],
+                [pos.x - 1.0, pos.y - 1.0, pos.z + 1.0, 0.8, 0.0, 0.0],
+                [pos.x - 1.0, pos.y + 1.0, pos.z + 1.0, 0.8, 0.0, 0.0],
+                [pos.x - 1.0, pos.y - 1.0, pos.z - 1.0, 0.8, 0.0, 0.0],
+                [pos.x - 1.0, pos.y + 1.0, pos.z + 1.0, 0.8, 0.0, 0.0],
+                [pos.x - 1.0, pos.y + 1.0, pos.z - 1.0, 0.8, 0.0, 0.0],
+            ];
+            vertices.extend(enemy_verts);
+        }
+
+        // Add bullets (small yellow cubes)
+        for bullet in &self.bullets {
+            let pos = bullet.position;
+            let size = 0.1;
+            let bullet_verts = vec![
+                // Front
+                [pos.x - size, pos.y - size, pos.z + size, 1.0, 1.0, 0.0],
+                [pos.x + size, pos.y - size, pos.z + size, 1.0, 1.0, 0.0],
+                [pos.x + size, pos.y + size, pos.z + size, 1.0, 1.0, 0.0],
+                [pos.x - size, pos.y - size, pos.z + size, 1.0, 1.0, 0.0],
+                [pos.x + size, pos.y + size, pos.z + size, 1.0, 1.0, 0.0],
+                [pos.x - size, pos.y + size, pos.z + size, 1.0, 1.0, 0.0],
+                // Back
+                [pos.x - size, pos.y - size, pos.z - size, 0.8, 0.8, 0.0],
+                [pos.x - size, pos.y + size, pos.z - size, 0.8, 0.8, 0.0],
+                [pos.x + size, pos.y + size, pos.z - size, 0.8, 0.8, 0.0],
+                [pos.x - size, pos.y - size, pos.z - size, 0.8, 0.8, 0.0],
+                [pos.x + size, pos.y + size, pos.z - size, 0.8, 0.8, 0.0],
+                [pos.x + size, pos.y - size, pos.z - size, 0.8, 0.8, 0.0],
+                // Top
+                [pos.x - size, pos.y + size, pos.z + size, 0.9, 0.9, 0.0],
+                [pos.x + size, pos.y + size, pos.z + size, 0.9, 0.9, 0.0],
+                [pos.x + size, pos.y + size, pos.z - size, 0.9, 0.9, 0.0],
+                [pos.x - size, pos.y + size, pos.z + size, 0.9, 0.9, 0.0],
+                [pos.x + size, pos.y + size, pos.z - size, 0.9, 0.9, 0.0],
+                [pos.x - size, pos.y + size, pos.z - size, 0.9, 0.9, 0.0],
+                // Bottom
+                [pos.x - size, pos.y - size, pos.z - size, 0.7, 0.7, 0.0],
+                [pos.x + size, pos.y - size, pos.z - size, 0.7, 0.7, 0.0],
+                [pos.x + size, pos.y - size, pos.z + size, 0.7, 0.7, 0.0],
+                [pos.x - size, pos.y - size, pos.z - size, 0.7, 0.7, 0.0],
+                [pos.x + size, pos.y - size, pos.z + size, 0.7, 0.7, 0.0],
+                [pos.x - size, pos.y - size, pos.z + size, 0.7, 0.7, 0.0],
+                // Right
+                [pos.x + size, pos.y - size, pos.z + size, 0.85, 0.85, 0.0],
+                [pos.x + size, pos.y - size, pos.z - size, 0.85, 0.85, 0.0],
+                [pos.x + size, pos.y + size, pos.z - size, 0.85, 0.85, 0.0],
+                [pos.x + size, pos.y - size, pos.z + size, 0.85, 0.85, 0.0],
+                [pos.x + size, pos.y + size, pos.z - size, 0.85, 0.85, 0.0],
+                [pos.x + size, pos.y + size, pos.z + size, 0.85, 0.85, 0.0],
+                // Left
+                [pos.x - size, pos.y - size, pos.z - size, 0.75, 0.75, 0.0],
+                [pos.x - size, pos.y - size, pos.z + size, 0.75, 0.75, 0.0],
+                [pos.x - size, pos.y + size, pos.z + size, 0.75, 0.75, 0.0],
+                [pos.x - size, pos.y - size, pos.z - size, 0.75, 0.75, 0.0],
+                [pos.x - size, pos.y + size, pos.z + size, 0.75, 0.75, 0.0],
+                [pos.x - size, pos.y + size, pos.z - size, 0.75, 0.75, 0.0],
+            ];
+            vertices.extend(bullet_verts);
+        }
+
+        // Recreate vertex/index buffers with dynamic data
+        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Vertex Buffer"),
+            contents: bytemuck::cast_slice(&vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        let indices: Vec<u16> = (0..vertices.len() as u16).collect();
+        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Index Buffer"),
+            contents: bytemuck::cast_slice(&indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
 
         let output = surface.get_current_texture().unwrap();
         let view = output
@@ -426,7 +728,34 @@ impl App {
             pass.set_bind_group(0, bind_group, &[]);
             pass.set_vertex_buffer(0, vertex_buffer.slice(..));
             pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-            pass.draw_indexed(0..self.index_count, 0, 0..1);
+            pass.draw_indexed(0..vertices.len() as u32, 0, 0..1);
+        }
+
+        // Render UI (crosshairs and gun)
+        {
+            let ui_pipeline = self.ui_pipeline.as_ref().unwrap();
+            let ui_vertex_buffer = self.ui_vertex_buffer.as_ref().unwrap();
+            let ui_index_buffer = self.ui_index_buffer.as_ref().unwrap();
+
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("UI Render Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+            });
+
+            pass.set_pipeline(ui_pipeline);
+            pass.set_vertex_buffer(0, ui_vertex_buffer.slice(..));
+            pass.set_index_buffer(ui_index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+            pass.draw_indexed(0..14, 0, 0..1); // 14 vertices for crosshair + gun
         }
 
         queue.submit([encoder.finish()]);
@@ -456,7 +785,7 @@ impl ApplicationHandler for App {
         event_loop.set_control_flow(ControlFlow::Poll);
 
         println!("=== SIMPLE QUAKE ===");
-        println!("WASD: Move | Mouse: Look | ESC: Quit");
+        println!("WASD: Move | Mouse: Look | Left Click: Shoot | ESC: Quit");
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -503,6 +832,11 @@ impl ApplicationHandler for App {
                 self.input.mouse_dy = (position.y - self.input.last_mouse_y) as f32;
                 self.input.last_mouse_x = position.x;
                 self.input.last_mouse_y = position.y;
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                if button == MouseButton::Left && state == ElementState::Pressed {
+                    self.input.shoot = true;
+                }
             }
             _ => {}
         }
