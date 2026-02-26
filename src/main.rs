@@ -120,6 +120,10 @@ struct App {
     ui_pipeline: Option<wgpu::RenderPipeline>,
     ui_vertex_buffer: Option<wgpu::Buffer>,
     ui_index_buffer: Option<wgpu::Buffer>,
+    gun_texture_pipeline: Option<wgpu::RenderPipeline>,
+    gun_texture_bind_group: Option<wgpu::BindGroup>,
+    gun_vertex_buffer: Option<wgpu::Buffer>,
+    gun_index_buffer: Option<wgpu::Buffer>,
 }
 
 impl App {
@@ -162,6 +166,10 @@ impl App {
             ui_pipeline: None,
             ui_vertex_buffer: None,
             ui_index_buffer: None,
+            gun_texture_pipeline: None,
+            gun_texture_bind_group: None,
+            gun_vertex_buffer: None,
+            gun_index_buffer: None,
         }
     }
 
@@ -449,7 +457,7 @@ impl App {
             multiview: None,
         });
 
-        // Crosshair vertices (screen space coordinates)
+        // Crosshair vertices (screen space coordinates) - gun is now rendered separately with texture
         let ui_vertices: Vec<[f32; 5]> = vec![
             // Crosshair - horizontal line
             [-0.02, 0.0, 1.0, 1.0, 1.0],
@@ -457,18 +465,6 @@ impl App {
             // Crosshair - vertical line
             [0.0, -0.02, 1.0, 1.0, 1.0],
             [0.0, 0.02, 1.0, 1.0, 1.0],
-            // Gun rectangle (bottom right)
-            [0.7, -0.5, 0.3, 0.3, 0.3],
-            [0.9, -0.5, 0.3, 0.3, 0.3],
-            [0.9, -0.5, 0.3, 0.3, 0.3],
-            [0.9, -0.9, 0.3, 0.3, 0.3],
-            [0.9, -0.9, 0.3, 0.3, 0.3],
-            [0.7, -0.9, 0.3, 0.3, 0.3],
-            [0.7, -0.9, 0.3, 0.3, 0.3],
-            [0.7, -0.5, 0.3, 0.3, 0.3],
-            // Gun barrel
-            [0.75, -0.5, 0.5, 0.5, 0.5],
-            [0.75, -0.3, 0.5, 0.5, 0.5],
         ];
 
         let ui_vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -481,6 +477,204 @@ impl App {
         let ui_index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("UI Index Buffer"),
             contents: bytemuck::cast_slice(&ui_indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+
+        // Load gun texture
+        let gun_img = image::load_from_memory(include_bytes!("../assets/gun_sprite.png"))
+            .expect("Failed to load gun sprite")
+            .to_rgba8();
+        let gun_dimensions = gun_img.dimensions();
+
+        let gun_texture_size = wgpu::Extent3d {
+            width: gun_dimensions.0,
+            height: gun_dimensions.1,
+            depth_or_array_layers: 1,
+        };
+
+        let gun_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Gun Texture"),
+            size: gun_texture_size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+
+        queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &gun_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &gun_img,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * gun_dimensions.0),
+                rows_per_image: Some(gun_dimensions.1),
+            },
+            gun_texture_size,
+        );
+
+        let gun_texture_view = gun_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let gun_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::FilterMode::Nearest,
+            ..Default::default()
+        });
+
+        // Create texture bind group layout
+        let gun_texture_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Gun Texture Bind Group Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        multisampled: false,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
+        let gun_texture_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Gun Texture Bind Group"),
+            layout: &gun_texture_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&gun_texture_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&gun_sampler),
+                },
+            ],
+        });
+
+        // Create textured shader for gun
+        let gun_texture_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Gun Texture Shader"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(
+                r#"
+                @group(0) @binding(0)
+                var t_texture: texture_2d<f32>;
+                @group(0) @binding(1)
+                var t_sampler: sampler;
+
+                struct VertexInput {
+                    @location(0) position: vec2<f32>,
+                    @location(1) tex_coords: vec2<f32>,
+                }
+
+                struct VertexOutput {
+                    @builtin(position) clip_position: vec4<f32>,
+                    @location(0) tex_coords: vec2<f32>,
+                }
+
+                @vertex
+                fn vs_main(input: VertexInput) -> VertexOutput {
+                    var out: VertexOutput;
+                    out.clip_position = vec4<f32>(input.position, 0.0, 1.0);
+                    out.tex_coords = input.tex_coords;
+                    return out;
+                }
+
+                @fragment
+                fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
+                    return textureSample(t_texture, t_sampler, input.tex_coords);
+                }
+            "#,
+            )),
+        });
+
+        let gun_texture_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Gun Texture Pipeline Layout"),
+            bind_group_layouts: &[&gun_texture_bind_group_layout],
+            push_constant_ranges: &[],
+        });
+
+        let gun_texture_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Gun Texture Pipeline"),
+            layout: Some(&gun_texture_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &gun_texture_shader,
+                entry_point: "vs_main",
+                buffers: &[wgpu::VertexBufferLayout {
+                    array_stride: 16, // 2 floats (position) + 2 floats (tex_coords)
+                    step_mode: wgpu::VertexStepMode::Vertex,
+                    attributes: &[
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x2,
+                            offset: 0,
+                            shader_location: 0,
+                        },
+                        wgpu::VertexAttribute {
+                            format: wgpu::VertexFormat::Float32x2,
+                            offset: 8,
+                            shader_location: 1,
+                        },
+                    ],
+                }],
+            },
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            fragment: Some(wgpu::FragmentState {
+                module: &gun_texture_shader,
+                entry_point: "fs_main",
+                targets: &[Some(wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            multiview: None,
+        });
+
+        // Gun sprite quad vertices (center-bottom, close to crosshair)
+        // Format: [x, y, u, v] where (x,y) is screen position and (u,v) is texture coordinate
+        // Screen coords: x: -1 (left) to 1 (right), y: -1 (bottom) to 1 (top)
+        let gun_vertices: Vec<[f32; 4]> = vec![
+            // Bottom-left
+            [-0.5, -0.4, 0.0, 1.0],
+            // Bottom-right
+            [0.5, -0.4, 1.0, 1.0],
+            // Top-right
+            [0.5, -1.0, 1.0, 0.0],
+            // Top-left
+            [-0.5, -1.0, 0.0, 0.0],
+        ];
+
+        let gun_vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Gun Vertex Buffer"),
+            contents: bytemuck::cast_slice(&gun_vertices),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+
+        let gun_indices: Vec<u16> = vec![0, 1, 2, 0, 2, 3];
+        let gun_index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("Gun Index Buffer"),
+            contents: bytemuck::cast_slice(&gun_indices),
             usage: wgpu::BufferUsages::INDEX,
         });
 
@@ -498,6 +692,10 @@ impl App {
         self.ui_pipeline = Some(ui_pipeline);
         self.ui_vertex_buffer = Some(ui_vertex_buffer);
         self.ui_index_buffer = Some(ui_index_buffer);
+        self.gun_texture_pipeline = Some(gun_texture_pipeline);
+        self.gun_texture_bind_group = Some(gun_texture_bind_group);
+        self.gun_vertex_buffer = Some(gun_vertex_buffer);
+        self.gun_index_buffer = Some(gun_index_buffer);
     }
 
     fn update(&mut self) {
@@ -760,7 +958,7 @@ impl App {
             pass.draw_indexed(0..vertices.len() as u32, 0, 0..1);
         }
 
-        // Render UI (crosshairs and gun)
+        // Render UI (crosshairs only - gun will be rendered separately with texture)
         {
             let ui_pipeline = self.ui_pipeline.as_ref().unwrap();
             let ui_vertex_buffer = self.ui_vertex_buffer.as_ref().unwrap();
@@ -784,7 +982,36 @@ impl App {
             pass.set_pipeline(ui_pipeline);
             pass.set_vertex_buffer(0, ui_vertex_buffer.slice(..));
             pass.set_index_buffer(ui_index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-            pass.draw_indexed(0..14, 0, 0..1); // 14 vertices for crosshair + gun
+            pass.draw_indexed(0..4, 0, 0..1); // Only 4 vertices for crosshair (removed gun lines)
+        }
+
+        // Render textured gun sprite
+        {
+            let gun_pipeline = self.gun_texture_pipeline.as_ref().unwrap();
+            let gun_bind_group = self.gun_texture_bind_group.as_ref().unwrap();
+            let gun_vertex_buffer = self.gun_vertex_buffer.as_ref().unwrap();
+            let gun_index_buffer = self.gun_index_buffer.as_ref().unwrap();
+
+            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("Gun Texture Render Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Load,
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+            });
+
+            pass.set_pipeline(gun_pipeline);
+            pass.set_bind_group(0, gun_bind_group, &[]);
+            pass.set_vertex_buffer(0, gun_vertex_buffer.slice(..));
+            pass.set_index_buffer(gun_index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+            pass.draw_indexed(0..6, 0, 0..1); // 6 indices for 2 triangles (quad)
         }
 
         queue.submit([encoder.finish()]);
