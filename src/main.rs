@@ -15,6 +15,7 @@ const WINDOW_HEIGHT: u32 = 720;
 struct Enemy {
     position: Vector3<f32>,
     alive: bool,
+    angle_degrees: i32,
 }
 
 struct Bullet {
@@ -123,6 +124,26 @@ struct App {
 
 impl App {
     fn new() -> Self {
+        // Create enemies at every 5 degrees in a 180-degree arc in front of the player
+        let mut enemies = Vec::new();
+        let distance = 10.0; // Distance from origin
+        let height = 1.0;
+
+        // Generate enemies from -90 to +90 degrees (180 degree field)
+        for angle_deg in (-90..=90).step_by(5) {
+            let angle_rad = (angle_deg as f32).to_radians();
+            // The player starts looking down negative Z axis (yaw = 0)
+            // So we place enemies in a semicircle around that
+            let x = angle_rad.sin() * distance;
+            let z = -angle_rad.cos() * distance;
+
+            enemies.push(Enemy {
+                position: Vector3::new(x, height, z),
+                alive: true,
+                angle_degrees: angle_deg,
+            });
+        }
+
         Self {
             window: None,
             device: None,
@@ -136,10 +157,7 @@ impl App {
             camera_buffer: None,
             bind_group: None,
             pipeline: None,
-            enemies: vec![Enemy {
-                position: Vector3::new(0.0, 1.0, -10.0),
-                alive: true,
-            }],
+            enemies,
             bullets: Vec::new(),
             ui_pipeline: None,
             ui_vertex_buffer: None,
@@ -505,6 +523,16 @@ impl App {
         // Mouse look
         self.camera.yaw -= self.input.mouse_dx * 0.002;  // Negative for natural mouse look
         self.camera.pitch -= self.input.mouse_dy * 0.002;  // Negative for natural mouse look
+
+        // Wrap yaw to keep it in range [-π, π] for smooth 360-degree rotation
+        use std::f32::consts::PI;
+        if self.camera.yaw > PI {
+            self.camera.yaw -= 2.0 * PI;
+        } else if self.camera.yaw < -PI {
+            self.camera.yaw += 2.0 * PI;
+        }
+
+        // Clamp pitch to prevent looking too far up or down (standard FPS behavior)
         self.camera.pitch = self.camera.pitch.clamp(-1.5, 1.5);
 
         self.input.mouse_dx = 0.0;
@@ -538,7 +566,8 @@ impl App {
                 let dist = (bullet.position - enemy.position).magnitude();
                 if dist < 1.5 {
                     enemy.alive = false;
-                    println!("Enemy destroyed!");
+                    let sign = if enemy.angle_degrees >= 0 { "positive" } else { "negative" };
+                    println!("Enemy at {} angle with value: {} degrees, destroyed!", sign, enemy.angle_degrees.abs());
                 }
             }
         }
@@ -778,8 +807,17 @@ impl ApplicationHandler for App {
                 .unwrap(),
         );
 
-        let _ = window.set_cursor_grab(winit::window::CursorGrabMode::Confined);
+        // Try to lock cursor for unlimited rotation, fallback to confined mode
+        if window.set_cursor_grab(winit::window::CursorGrabMode::Locked).is_err() {
+            let _ = window.set_cursor_grab(winit::window::CursorGrabMode::Confined);
+            println!("Using confined cursor mode (locked mode not supported)");
+        }
         window.set_cursor_visible(false);
+
+        // Center cursor initially
+        let center_x = WINDOW_WIDTH as f64 / 2.0;
+        let center_y = WINDOW_HEIGHT as f64 / 2.0;
+        let _ = window.set_cursor_position(winit::dpi::PhysicalPosition::new(center_x, center_y));
 
         self.init_rendering(window);
         event_loop.set_control_flow(ControlFlow::Poll);
@@ -822,16 +860,38 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
+                // On first mouse event, just initialize position without calculating delta
                 if self.input.first_mouse {
                     self.input.last_mouse_x = position.x;
                     self.input.last_mouse_y = position.y;
                     self.input.first_mouse = false;
-                }
+                } else {
+                    // Calculate mouse delta
+                    let dx = (position.x - self.input.last_mouse_x) as f32;
+                    let dy = (position.y - self.input.last_mouse_y) as f32;
 
-                self.input.mouse_dx = (position.x - self.input.last_mouse_x) as f32;
-                self.input.mouse_dy = (position.y - self.input.last_mouse_y) as f32;
-                self.input.last_mouse_x = position.x;
-                self.input.last_mouse_y = position.y;
+                    // Ignore huge jumps (e.g., cursor re-centering or entering window)
+                    if dx.abs() < 200.0 && dy.abs() < 200.0 {
+                        self.input.mouse_dx = dx;
+                        self.input.mouse_dy = dy;
+                    }
+
+                    self.input.last_mouse_x = position.x;
+                    self.input.last_mouse_y = position.y;
+
+                    // Re-center cursor if it gets too close to edges (for confined mode)
+                    let window = self.window.as_ref().unwrap();
+                    let center_x = WINDOW_WIDTH as f64 / 2.0;
+                    let center_y = WINDOW_HEIGHT as f64 / 2.0;
+                    let dist_from_center = ((position.x - center_x).powi(2) + (position.y - center_y).powi(2)).sqrt();
+
+                    // If cursor is far from center (more than 30% of window size), re-center it
+                    if dist_from_center > (WINDOW_WIDTH as f64 * 0.3) {
+                        let _ = window.set_cursor_position(winit::dpi::PhysicalPosition::new(center_x, center_y));
+                        self.input.last_mouse_x = center_x;
+                        self.input.last_mouse_y = center_y;
+                    }
+                }
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 if button == MouseButton::Left && state == ElementState::Pressed {
@@ -845,6 +905,19 @@ impl ApplicationHandler for App {
     fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
         if let Some(window) = &self.window {
             window.request_redraw();
+        }
+    }
+
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device_id: winit::event::DeviceId,
+        event: winit::event::DeviceEvent,
+    ) {
+        // Handle raw mouse motion for locked cursor mode
+        if let winit::event::DeviceEvent::MouseMotion { delta } = event {
+            self.input.mouse_dx = delta.0 as f32;
+            self.input.mouse_dy = delta.1 as f32;
         }
     }
 }
