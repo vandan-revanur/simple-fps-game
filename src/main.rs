@@ -1,4 +1,6 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI32, Ordering};
+use std::time::Instant;
 
 use cgmath::{perspective, Deg, EuclideanSpace, InnerSpace, Matrix4, Point3, Vector3};
 use wgpu::util::DeviceExt;
@@ -10,6 +12,72 @@ use winit::window::{Window, WindowId};
 
 const WINDOW_WIDTH: u32 = 1280;
 const WINDOW_HEIGHT: u32 = 720;
+
+// --- Mouse accumulator (lock-free, stores scaled fractional deltas) ---
+const MOUSE_SCALE: f32 = 1000.0;
+struct MouseAccum {
+    dx: AtomicI32,
+    dy: AtomicI32,
+    active: std::sync::atomic::AtomicBool,
+}
+impl MouseAccum {
+    fn new() -> Self {
+        Self {
+            dx: AtomicI32::new(0),
+            dy: AtomicI32::new(0),
+            active: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+    fn add_raw(&self, dx: i32, dy: i32) {
+        // raw int deltas (from /dev/input/mice). Scale to preserve fractions.
+        self.dx.fetch_add((dx as f32 * MOUSE_SCALE) as i32, Ordering::Relaxed);
+        self.dy.fetch_add((dy as f32 * MOUSE_SCALE) as i32, Ordering::Relaxed);
+    }
+    fn add_f64(&self, dx: f64, dy: f64) {
+        self.dx.fetch_add((dx as f64 * MOUSE_SCALE as f64) as i32, Ordering::Relaxed);
+        self.dy.fetch_add((dy as f64 * MOUSE_SCALE as f64) as i32, Ordering::Relaxed);
+    }
+    fn take(&self) -> (f32, f32) {
+        let dx = self.dx.swap(0, Ordering::Relaxed);
+        let dy = self.dy.swap(0, Ordering::Relaxed);
+        (dx as f32 / MOUSE_SCALE, dy as f32 / MOUSE_SCALE)
+    }
+    fn set_active(&self) { self.active.store(true, Ordering::Relaxed); }
+    fn is_active(&self) -> bool { self.active.load(Ordering::Relaxed) }
+}
+
+fn spawn_mouse_thread(accum: Arc<MouseAccum>) {
+    std::thread::spawn(move || {
+        use std::io::Read;
+        // Write a small log so the user can inspect if the thread started
+        let _ = std::fs::write("/tmp/simple_quake_mouse.log", "mouse thread starting\n");
+        match std::fs::File::open("/dev/input/mice") {
+            Ok(mut f) => {
+                let _ = std::fs::write("/tmp/simple_quake_mouse.log", "opened /dev/input/mice\n");
+                accum.set_active();
+                let mut buf = [0u8; 3];
+                let mut count = 0u64;
+                loop {
+                    if f.read_exact(&mut buf).is_err() { break; }
+                    // PS/2 3-byte packet: buf[1]=dx, buf[2]=dy (signed)
+                    let dx = buf[1] as i8 as i32;
+                    let dy = -(buf[2] as i8 as i32); // invert Y
+                    accum.add_raw(dx, dy);
+                    count += 1;
+                    if count % 200 == 0 {
+                        let _ = std::fs::write("/tmp/simple_quake_mouse.log",
+                            format!("mouse events: {} last_dx={} last_dy={}\n", count, dx, dy));
+                    }
+                }
+                let _ = std::fs::write("/tmp/simple_quake_mouse.log", "mouse thread exiting\n");
+            }
+            Err(e) => {
+                let _ = std::fs::write("/tmp/simple_quake_mouse.log",
+                    format!("failed to open /dev/input/mice: {}\n", e));
+            }
+        }
+    });
+}
 
 #[derive(Clone)]
 struct Enemy {
@@ -91,11 +159,10 @@ struct Input {
     left: bool,
     right: bool,
     shoot: bool,
-    mouse_dx: f32,
-    mouse_dy: f32,
-    last_mouse_x: f64,
-    last_mouse_y: f64,
-    first_mouse: bool,
+    look_left: bool,
+    look_right: bool,
+    look_up: bool,
+    look_down: bool,
 }
 
 impl Input {
@@ -106,11 +173,10 @@ impl Input {
             left: false,
             right: false,
             shoot: false,
-            mouse_dx: 0.0,
-            mouse_dy: 0.0,
-            last_mouse_x: 0.0,
-            last_mouse_y: 0.0,
-            first_mouse: true,
+            look_left: false,
+            look_right: false,
+            look_up: false,
+            look_down: false,
         }
     }
 }
@@ -131,6 +197,8 @@ struct App {
     ui_pipeline: Option<wgpu::RenderPipeline>,
     ui_vertex_buffer: Option<wgpu::Buffer>,
     ui_index_buffer: Option<wgpu::Buffer>,
+    last_update: Instant,
+    mouse_accum: Arc<MouseAccum>,
 }
 
 impl App {
@@ -155,6 +223,9 @@ impl App {
             });
         }
 
+        let mouse_accum = Arc::new(MouseAccum::new());
+        spawn_mouse_thread(Arc::clone(&mouse_accum));
+
         Self {
             window: None,
             device: None,
@@ -171,6 +242,8 @@ impl App {
             ui_pipeline: None,
             ui_vertex_buffer: None,
             ui_index_buffer: None,
+            last_update: Instant::now(),
+            mouse_accum,
         }
     }
 
@@ -439,57 +512,62 @@ impl App {
     }
 
     fn update(&mut self) {
-        let speed = 0.1;
+        let now = Instant::now();
+        let dt = now.duration_since(self.last_update).as_secs_f32().min(0.05);
+        self.last_update = now;
+
+        let move_speed = 5.0;
 
         let forward = Vector3::new(-self.camera.yaw.sin(), 0.0, -self.camera.yaw.cos());
-        let right = Vector3::new(self.camera.yaw.cos(), 0.0, -self.camera.yaw.sin());
+        let right   = Vector3::new( self.camera.yaw.cos(), 0.0, -self.camera.yaw.sin());
 
-        if self.input.forward  { self.camera.position += forward * speed; }
-        if self.input.backward { self.camera.position -= forward * speed; }
-        if self.input.left     { self.camera.position -= right * speed; }
-        if self.input.right    { self.camera.position += right * speed; }
+        if self.input.forward  { self.camera.position += forward * move_speed * dt; }
+        if self.input.backward { self.camera.position -= forward * move_speed * dt; }
+        if self.input.left     { self.camera.position -= right   * move_speed * dt; }
+        if self.input.right    { self.camera.position += right   * move_speed * dt; }
 
-        self.camera.yaw   -= self.input.mouse_dx * 0.002;
-        self.camera.pitch -= self.input.mouse_dy * 0.002;
+        // Consume accumulated mouse deltas once per frame (both raw thread and DeviceEvent write here)
+        let (mdx, mdy) = self.mouse_accum.take();
+        if mdx.abs() > 0.0001 || mdy.abs() > 0.0001 {
+            const SENSITIVITY: f32 = 0.003;
+            self.camera.yaw   -= mdx * SENSITIVITY;
+            self.camera.pitch -= mdy * SENSITIVITY;
+        }
+
+        // Keyboard look (arrow keys) — fallback
+        let look_speed = 2.5; // radians per second
+        if self.input.look_left  { self.camera.yaw   += look_speed * dt; }
+        if self.input.look_right { self.camera.yaw   -= look_speed * dt; }
+        if self.input.look_up    { self.camera.pitch  += look_speed * dt; }
+        if self.input.look_down  { self.camera.pitch  -= look_speed * dt; }
 
         use std::f32::consts::PI;
-        if self.camera.yaw > PI        { self.camera.yaw -= 2.0 * PI; }
-        else if self.camera.yaw < -PI  { self.camera.yaw += 2.0 * PI; }
+        if self.camera.yaw > PI       { self.camera.yaw -= 2.0 * PI; }
+        else if self.camera.yaw < -PI { self.camera.yaw += 2.0 * PI; }
         self.camera.pitch = self.camera.pitch.clamp(-1.5, 1.5);
 
-        self.input.mouse_dx = 0.0;
-        self.input.mouse_dy = 0.0;
-
         if self.input.shoot {
-            let dir      = self.camera.get_forward_vector().normalize();
-            let muzzle   = Self::gun_barrel_tip(&self.camera);
-            self.bullets.push(Bullet {
-                position: muzzle,
-                direction: dir,
-                lifetime: 5.0,
-            });
+            let dir    = self.camera.get_forward_vector().normalize();
+            let muzzle = Self::gun_barrel_tip(&self.camera);
+            self.bullets.push(Bullet { position: muzzle, direction: dir, lifetime: 5.0 });
             self.input.shoot = false;
         }
 
-        let bullet_speed = 0.5;
+        let bullet_speed = 20.0;
         self.bullets.retain_mut(|bullet| {
-            bullet.position += bullet.direction * bullet_speed;
-            bullet.lifetime -= 0.016;
+            bullet.position += bullet.direction * bullet_speed * dt;
+            bullet.lifetime -= dt;
             bullet.lifetime > 0.0
         });
 
         for bullet in &self.bullets {
             for enemy in &mut self.enemies {
                 if !enemy.alive { continue; }
-                let dist = (bullet.position - enemy.position).magnitude();
-                if dist < 1.5 {
+                if (bullet.position - enemy.position).magnitude() < 1.5 {
                     enemy.alive = false;
                     let sign = if enemy.angle_degrees >= 0 { "positive" } else { "negative" };
-                    println!(
-                        "Enemy at {} angle with value: {} degrees, destroyed!",
-                        sign,
-                        enemy.angle_degrees.abs()
-                    );
+                    println!("Enemy at {} angle with value: {} degrees, destroyed!",
+                        sign, enemy.angle_degrees.abs());
                 }
             }
         }
@@ -767,6 +845,7 @@ impl App {
 
         queue.submit([encoder.finish()]);
         output.present();
+        // No request_redraw() here — about_to_wait drives the loop
     }
 }
 
@@ -782,21 +861,29 @@ impl ApplicationHandler for App {
                 .unwrap(),
         );
 
+        // Try Locked first (gives raw device events). Fall back to Confined.
         if window.set_cursor_grab(winit::window::CursorGrabMode::Locked).is_err() {
             let _ = window.set_cursor_grab(winit::window::CursorGrabMode::Confined);
-            println!("Using confined cursor mode (locked mode not supported)");
+            let _ = std::fs::write("/tmp/simple_quake_mouse.log", "using confined cursor\n");
+        } else {
+            let _ = std::fs::write("/tmp/simple_quake_mouse.log", "using locked cursor\n");
         }
-        window.set_cursor_visible(false);
+        let _ = window.set_cursor_visible(false);
 
-        let center_x = WINDOW_WIDTH as f64 / 2.0;
-        let center_y = WINDOW_HEIGHT as f64 / 2.0;
-        let _ = window.set_cursor_position(winit::dpi::PhysicalPosition::new(center_x, center_y));
+        // Log whether the background /dev/input/mice reader is already active (if it started in new())
+        let active = self.mouse_accum.is_active();
+        let _ = std::fs::write("/tmp/simple_quake_mouse.log",
+            format!("mouse_accum active: {}\n", active));
 
         self.init_rendering(window);
         event_loop.set_control_flow(ControlFlow::Poll);
 
         println!("=== SIMPLE QUAKE ===");
-        println!("WASD: Move | Mouse: Look | Left Click: Shoot | ESC: Quit");
+        println!("Controls:");
+        println!("  WASD or Arrow Keys: Move");
+        println!("  Arrow Keys: Look around");
+        println!("  Left Click: Shoot");
+        println!("  ESC: Quit");
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -821,45 +908,24 @@ impl ApplicationHandler for App {
                 self.render();
             }
             WindowEvent::KeyboardInput {
-                event: KeyEvent { physical_key, state, .. }, ..
+                event: KeyEvent { physical_key, state, repeat, .. }, ..
             } => {
+                if repeat { return; }
                 let pressed = state == ElementState::Pressed;
                 if let PhysicalKey::Code(code) = physical_key {
                     match code {
+                        // Movement (WASD + Arrow keys both work)
                         KeyCode::KeyW  => self.input.forward   = pressed,
                         KeyCode::KeyS  => self.input.backward  = pressed,
                         KeyCode::KeyA  => self.input.left      = pressed,
                         KeyCode::KeyD  => self.input.right     = pressed,
+                        KeyCode::ArrowUp    => self.input.forward   = pressed,
+                        KeyCode::ArrowDown  => self.input.backward  = pressed,
+                        KeyCode::ArrowLeft  => self.input.left      = pressed,
+                        KeyCode::ArrowRight => self.input.right     = pressed,
+                        // NOTE: Space removed — shooting now uses left mouse button
                         KeyCode::Escape => event_loop.exit(),
                         _ => {}
-                    }
-                }
-            }
-            WindowEvent::CursorMoved { position, .. } => {
-                if self.input.first_mouse {
-                    self.input.last_mouse_x = position.x;
-                    self.input.last_mouse_y = position.y;
-                    self.input.first_mouse = false;
-                } else {
-                    let dx = (position.x - self.input.last_mouse_x) as f32;
-                    let dy = (position.y - self.input.last_mouse_y) as f32;
-
-                    if dx.abs() < 200.0 && dy.abs() < 200.0 {
-                        self.input.mouse_dx = dx;
-                        self.input.mouse_dy = dy;
-                    }
-
-                    self.input.last_mouse_x = position.x;
-                    self.input.last_mouse_y = position.y;
-
-                    let window = self.window.as_ref().unwrap();
-                    let center_x = WINDOW_WIDTH as f64 / 2.0;
-                    let center_y = WINDOW_HEIGHT as f64 / 2.0;
-                    let dist = ((position.x - center_x).powi(2) + (position.y - center_y).powi(2)).sqrt();
-                    if dist > (WINDOW_WIDTH as f64 * 0.3) {
-                        let _ = window.set_cursor_position(winit::dpi::PhysicalPosition::new(center_x, center_y));
-                        self.input.last_mouse_x = center_x;
-                        self.input.last_mouse_y = center_y;
                     }
                 }
             }
@@ -884,9 +950,12 @@ impl ApplicationHandler for App {
         _device_id: winit::event::DeviceId,
         event: winit::event::DeviceEvent,
     ) {
+        // Always accept DeviceEvent mouse motion as a source of mouse look (fractional preserved)
         if let winit::event::DeviceEvent::MouseMotion { delta } = event {
-            self.input.mouse_dx = delta.0 as f32;
-            self.input.mouse_dy = delta.1 as f32;
+            // log occasionally
+            let _ = std::fs::write("/tmp/simple_quake_mouse.log",
+                format!("dev_event dx={:.3} dy={:.3}\n", delta.0, delta.1));
+            self.mouse_accum.add_f64(delta.0, delta.1);
         }
     }
 }
@@ -896,3 +965,6 @@ fn main() {
     let mut app = App::new();
     event_loop.run_app(&mut app).unwrap();
 }
+
+
+
