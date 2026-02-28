@@ -70,6 +70,19 @@ impl Camera {
             -self.yaw.cos() * self.pitch.cos(),
         )
     }
+
+    /// Returns right vector (perpendicular to forward, horizontal)
+    fn get_right_vector(&self) -> Vector3<f32> {
+        let forward = self.get_forward_vector().normalize();
+        forward.cross(Vector3::unit_y()).normalize()
+    }
+
+    /// Returns up vector relative to camera
+    fn get_up_vector(&self) -> Vector3<f32> {
+        let forward = self.get_forward_vector().normalize();
+        let right = self.get_right_vector();
+        right.cross(forward).normalize()
+    }
 }
 
 struct Input {
@@ -107,11 +120,9 @@ struct App {
     device: Option<wgpu::Device>,
     queue: Option<wgpu::Queue>,
     surface: Option<wgpu::Surface<'static>>,
+    surface_config: Option<wgpu::SurfaceConfiguration>,
     camera: Camera,
     input: Input,
-    vertex_buffer: Option<wgpu::Buffer>,
-    index_buffer: Option<wgpu::Buffer>,
-    index_count: u32,
     camera_buffer: Option<wgpu::Buffer>,
     bind_group: Option<wgpu::BindGroup>,
     pipeline: Option<wgpu::RenderPipeline>,
@@ -120,10 +131,6 @@ struct App {
     ui_pipeline: Option<wgpu::RenderPipeline>,
     ui_vertex_buffer: Option<wgpu::Buffer>,
     ui_index_buffer: Option<wgpu::Buffer>,
-    gun_texture_pipeline: Option<wgpu::RenderPipeline>,
-    gun_texture_bind_group: Option<wgpu::BindGroup>,
-    gun_vertex_buffer: Option<wgpu::Buffer>,
-    gun_index_buffer: Option<wgpu::Buffer>,
 }
 
 impl App {
@@ -153,11 +160,9 @@ impl App {
             device: None,
             queue: None,
             surface: None,
+            surface_config: None,
             camera: Camera::new(),
             input: Input::new(),
-            vertex_buffer: None,
-            index_buffer: None,
-            index_count: 0,
             camera_buffer: None,
             bind_group: None,
             pipeline: None,
@@ -166,10 +171,6 @@ impl App {
             ui_pipeline: None,
             ui_vertex_buffer: None,
             ui_index_buffer: None,
-            gun_texture_pipeline: None,
-            gun_texture_bind_group: None,
-            gun_vertex_buffer: None,
-            gun_index_buffer: None,
         }
     }
 
@@ -197,77 +198,22 @@ impl App {
             .or_else(|| surface_caps.formats.first().copied())
             .expect("No compatible surface format found");
 
+        // Use the actual physical size of the window (important on HiDPI displays)
+        let phys = window.inner_size();
+        let surf_width  = phys.width.max(1);
+        let surf_height = phys.height.max(1);
+
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format,
-            width: WINDOW_WIDTH,
-            height: WINDOW_HEIGHT,
+            width: surf_width,
+            height: surf_height,
             present_mode: wgpu::PresentMode::Fifo,
             alpha_mode: wgpu::CompositeAlphaMode::Auto,
             desired_maximum_frame_latency: 1,
             view_formats: vec![],
         };
         surface.configure(&device, &config);
-
-        // Floor vertices (blue)
-        let vertices: Vec<[f32; 6]> = vec![
-            // Floor (blue) - large quad
-            [-50.0, 0.0, -50.0, 0.0, 0.0, 1.0],
-            [50.0, 0.0, -50.0, 0.0, 0.0, 1.0],
-            [50.0, 0.0, 50.0, 0.0, 0.0, 1.0],
-            [-50.0, 0.0, -50.0, 0.0, 0.0, 1.0],
-            [50.0, 0.0, 50.0, 0.0, 0.0, 1.0],
-            [-50.0, 0.0, 50.0, 0.0, 0.0, 1.0],
-            // Cube 1 (red) - at (0, 1, -10)
-            // Front
-            [-1.0, 0.0, -9.0, 1.0, 0.0, 0.0],
-            [1.0, 0.0, -9.0, 1.0, 0.0, 0.0],
-            [1.0, 2.0, -9.0, 1.0, 0.0, 0.0],
-            [-1.0, 0.0, -9.0, 1.0, 0.0, 0.0],
-            [1.0, 2.0, -9.0, 1.0, 0.0, 0.0],
-            [-1.0, 2.0, -9.0, 1.0, 0.0, 0.0],
-            // Back
-            [-1.0, 0.0, -11.0, 0.5, 0.0, 0.0],
-            [-1.0, 2.0, -11.0, 0.5, 0.0, 0.0],
-            [1.0, 2.0, -11.0, 0.5, 0.0, 0.0],
-            [-1.0, 0.0, -11.0, 0.5, 0.0, 0.0],
-            [1.0, 2.0, -11.0, 0.5, 0.0, 0.0],
-            [1.0, 0.0, -11.0, 0.5, 0.0, 0.0],
-            // Top
-            [-1.0, 2.0, -9.0, 0.7, 0.0, 0.0],
-            [1.0, 2.0, -9.0, 0.7, 0.0, 0.0],
-            [1.0, 2.0, -11.0, 0.7, 0.0, 0.0],
-            [-1.0, 2.0, -9.0, 0.7, 0.0, 0.0],
-            [1.0, 2.0, -11.0, 0.7, 0.0, 0.0],
-            [-1.0, 2.0, -11.0, 0.7, 0.0, 0.0],
-            // Right
-            [1.0, 0.0, -9.0, 0.6, 0.0, 0.0],
-            [1.0, 0.0, -11.0, 0.6, 0.0, 0.0],
-            [1.0, 2.0, -11.0, 0.6, 0.0, 0.0],
-            [1.0, 0.0, -9.0, 0.6, 0.0, 0.0],
-            [1.0, 2.0, -11.0, 0.6, 0.0, 0.0],
-            [1.0, 2.0, -9.0, 0.6, 0.0, 0.0],
-            // Left
-            [-1.0, 0.0, -11.0, 0.8, 0.0, 0.0],
-            [-1.0, 0.0, -9.0, 0.8, 0.0, 0.0],
-            [-1.0, 2.0, -9.0, 0.8, 0.0, 0.0],
-            [-1.0, 0.0, -11.0, 0.8, 0.0, 0.0],
-            [-1.0, 2.0, -9.0, 0.8, 0.0, 0.0],
-            [-1.0, 2.0, -11.0, 0.8, 0.0, 0.0],
-        ];
-
-        let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Vertex Buffer"),
-            contents: bytemuck::cast_slice(&vertices),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-
-        let indices: Vec<u16> = (0..vertices.len() as u16).collect();
-        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Index Buffer"),
-            contents: bytemuck::cast_slice(&indices),
-            usage: wgpu::BufferUsages::INDEX,
-        });
 
         // Camera uniform as flat array
         let camera_data = [0.0f32; 16];
@@ -379,7 +325,7 @@ impl App {
             multiview: None,
         });
 
-        // Create UI pipeline for crosshairs and gun
+        // --- UI pipeline (crosshair) ---
         let ui_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("UI Shader"),
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(
@@ -457,14 +403,12 @@ impl App {
             multiview: None,
         });
 
-        // Crosshair vertices (screen space coordinates) - gun is now rendered separately with texture
+        // Crosshair vertices
         let ui_vertices: Vec<[f32; 5]> = vec![
-            // Crosshair - horizontal line
             [-0.02, 0.0, 1.0, 1.0, 1.0],
-            [0.02, 0.0, 1.0, 1.0, 1.0],
-            // Crosshair - vertical line
+            [0.02,  0.0, 1.0, 1.0, 1.0],
             [0.0, -0.02, 1.0, 1.0, 1.0],
-            [0.0, 0.02, 1.0, 1.0, 1.0],
+            [0.0,  0.02, 1.0, 1.0, 1.0],
         ];
 
         let ui_vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -480,436 +424,278 @@ impl App {
             usage: wgpu::BufferUsages::INDEX,
         });
 
-        // Load gun texture
-        let gun_img = image::load_from_memory(include_bytes!("../assets/gun_sprite.png"))
-            .expect("Failed to load gun sprite")
-            .to_rgba8();
-        let gun_dimensions = gun_img.dimensions();
-
-        let gun_texture_size = wgpu::Extent3d {
-            width: gun_dimensions.0,
-            height: gun_dimensions.1,
-            depth_or_array_layers: 1,
-        };
-
-        let gun_texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("Gun Texture"),
-            size: gun_texture_size,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-
-        queue.write_texture(
-            wgpu::ImageCopyTexture {
-                texture: &gun_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &gun_img,
-            wgpu::ImageDataLayout {
-                offset: 0,
-                bytes_per_row: Some(4 * gun_dimensions.0),
-                rows_per_image: Some(gun_dimensions.1),
-            },
-            gun_texture_size,
-        );
-
-        let gun_texture_view = gun_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let gun_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            mipmap_filter: wgpu::FilterMode::Nearest,
-            ..Default::default()
-        });
-
-        // Create texture bind group layout
-        let gun_texture_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Gun Texture Bind Group Layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        multisampled: false,
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
-
-        let gun_texture_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("Gun Texture Bind Group"),
-            layout: &gun_texture_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&gun_texture_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&gun_sampler),
-                },
-            ],
-        });
-
-        // Create textured shader for gun
-        let gun_texture_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Gun Texture Shader"),
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(
-                r#"
-                @group(0) @binding(0)
-                var t_texture: texture_2d<f32>;
-                @group(0) @binding(1)
-                var t_sampler: sampler;
-
-                struct VertexInput {
-                    @location(0) position: vec2<f32>,
-                    @location(1) tex_coords: vec2<f32>,
-                }
-
-                struct VertexOutput {
-                    @builtin(position) clip_position: vec4<f32>,
-                    @location(0) tex_coords: vec2<f32>,
-                }
-
-                @vertex
-                fn vs_main(input: VertexInput) -> VertexOutput {
-                    var out: VertexOutput;
-                    out.clip_position = vec4<f32>(input.position, 0.0, 1.0);
-                    out.tex_coords = input.tex_coords;
-                    return out;
-                }
-
-                @fragment
-                fn fs_main(input: VertexOutput) -> @location(0) vec4<f32> {
-                    return textureSample(t_texture, t_sampler, input.tex_coords);
-                }
-            "#,
-            )),
-        });
-
-        let gun_texture_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Gun Texture Pipeline Layout"),
-            bind_group_layouts: &[&gun_texture_bind_group_layout],
-            push_constant_ranges: &[],
-        });
-
-        let gun_texture_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Gun Texture Pipeline"),
-            layout: Some(&gun_texture_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &gun_texture_shader,
-                entry_point: "vs_main",
-                buffers: &[wgpu::VertexBufferLayout {
-                    array_stride: 16, // 2 floats (position) + 2 floats (tex_coords)
-                    step_mode: wgpu::VertexStepMode::Vertex,
-                    attributes: &[
-                        wgpu::VertexAttribute {
-                            format: wgpu::VertexFormat::Float32x2,
-                            offset: 0,
-                            shader_location: 0,
-                        },
-                        wgpu::VertexAttribute {
-                            format: wgpu::VertexFormat::Float32x2,
-                            offset: 8,
-                            shader_location: 1,
-                        },
-                    ],
-                }],
-            },
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                ..Default::default()
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState::default(),
-            fragment: Some(wgpu::FragmentState {
-                module: &gun_texture_shader,
-                entry_point: "fs_main",
-                targets: &[Some(wgpu::ColorTargetState {
-                    format,
-                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-            }),
-            multiview: None,
-        });
-
-        // Gun sprite quad vertices (center-bottom, close to crosshair)
-        // Format: [x, y, u, v] where (x,y) is screen position and (u,v) is texture coordinate
-        // Screen coords: x: -1 (left) to 1 (right), y: -1 (bottom) to 1 (top)
-        let gun_vertices: Vec<[f32; 4]> = vec![
-            // Bottom-left
-            [-0.5, -0.4, 0.0, 1.0],
-            // Bottom-right
-            [0.5, -0.4, 1.0, 1.0],
-            // Top-right
-            [0.5, -1.0, 1.0, 0.0],
-            // Top-left
-            [-0.5, -1.0, 0.0, 0.0],
-        ];
-
-        let gun_vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Gun Vertex Buffer"),
-            contents: bytemuck::cast_slice(&gun_vertices),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-
-        let gun_indices: Vec<u16> = vec![0, 1, 2, 0, 2, 3];
-        let gun_index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Gun Index Buffer"),
-            contents: bytemuck::cast_slice(&gun_indices),
-            usage: wgpu::BufferUsages::INDEX,
-        });
-
-        // Now assign everything to self
         self.window = Some(window);
         self.device = Some(device);
         self.queue = Some(queue);
         self.surface = Some(surface);
-        self.vertex_buffer = Some(vertex_buffer);
-        self.index_buffer = Some(index_buffer);
-        self.index_count = vertices.len() as u32;
+        self.surface_config = Some(config);
+        self.camera.aspect = surf_width as f32 / surf_height as f32;
         self.camera_buffer = Some(camera_buffer);
         self.bind_group = Some(bind_group);
         self.pipeline = Some(pipeline);
         self.ui_pipeline = Some(ui_pipeline);
         self.ui_vertex_buffer = Some(ui_vertex_buffer);
         self.ui_index_buffer = Some(ui_index_buffer);
-        self.gun_texture_pipeline = Some(gun_texture_pipeline);
-        self.gun_texture_bind_group = Some(gun_texture_bind_group);
-        self.gun_vertex_buffer = Some(gun_vertex_buffer);
-        self.gun_index_buffer = Some(gun_index_buffer);
     }
 
     fn update(&mut self) {
         let speed = 0.1;
 
-        // Movement - standard FPS controls
         let forward = Vector3::new(-self.camera.yaw.sin(), 0.0, -self.camera.yaw.cos());
         let right = Vector3::new(self.camera.yaw.cos(), 0.0, -self.camera.yaw.sin());
 
-        if self.input.forward {
-            self.camera.position += forward * speed;
-        }
-        if self.input.backward {
-            self.camera.position -= forward * speed;
-        }
-        if self.input.left {
-            self.camera.position -= right * speed;
-        }
-        if self.input.right {
-            self.camera.position += right * speed;
-        }
+        if self.input.forward  { self.camera.position += forward * speed; }
+        if self.input.backward { self.camera.position -= forward * speed; }
+        if self.input.left     { self.camera.position -= right * speed; }
+        if self.input.right    { self.camera.position += right * speed; }
 
-        // Mouse look
-        self.camera.yaw -= self.input.mouse_dx * 0.002;  // Negative for natural mouse look
-        self.camera.pitch -= self.input.mouse_dy * 0.002;  // Negative for natural mouse look
+        self.camera.yaw   -= self.input.mouse_dx * 0.002;
+        self.camera.pitch -= self.input.mouse_dy * 0.002;
 
-        // Wrap yaw to keep it in range [-π, π] for smooth 360-degree rotation
         use std::f32::consts::PI;
-        if self.camera.yaw > PI {
-            self.camera.yaw -= 2.0 * PI;
-        } else if self.camera.yaw < -PI {
-            self.camera.yaw += 2.0 * PI;
-        }
-
-        // Clamp pitch to prevent looking too far up or down (standard FPS behavior)
+        if self.camera.yaw > PI        { self.camera.yaw -= 2.0 * PI; }
+        else if self.camera.yaw < -PI  { self.camera.yaw += 2.0 * PI; }
         self.camera.pitch = self.camera.pitch.clamp(-1.5, 1.5);
 
         self.input.mouse_dx = 0.0;
         self.input.mouse_dy = 0.0;
 
-        // Shooting
         if self.input.shoot {
-            let forward = self.camera.get_forward_vector().normalize();
+            let dir      = self.camera.get_forward_vector().normalize();
+            let muzzle   = Self::gun_barrel_tip(&self.camera);
             self.bullets.push(Bullet {
-                position: self.camera.position,
-                direction: forward,
+                position: muzzle,
+                direction: dir,
                 lifetime: 5.0,
             });
             self.input.shoot = false;
         }
 
-        // Update bullets
         let bullet_speed = 0.5;
         self.bullets.retain_mut(|bullet| {
             bullet.position += bullet.direction * bullet_speed;
-            bullet.lifetime -= 0.016; // Approximate frame time
+            bullet.lifetime -= 0.016;
             bullet.lifetime > 0.0
         });
 
-        // Check bullet-enemy collisions
         for bullet in &self.bullets {
             for enemy in &mut self.enemies {
-                if !enemy.alive {
-                    continue;
-                }
+                if !enemy.alive { continue; }
                 let dist = (bullet.position - enemy.position).magnitude();
                 if dist < 1.5 {
                     enemy.alive = false;
                     let sign = if enemy.angle_degrees >= 0 { "positive" } else { "negative" };
-                    println!("Enemy at {} angle with value: {} degrees, destroyed!", sign, enemy.angle_degrees.abs());
+                    println!(
+                        "Enemy at {} angle with value: {} degrees, destroyed!",
+                        sign,
+                        enemy.angle_degrees.abs()
+                    );
                 }
             }
         }
     }
 
+    /// Build vertices for a cuboid given min/max corners and a flat color [r,g,b].
+    /// Returns triangles (6 faces × 2 triangles × 3 verts = 36 verts).
+    /// Emit 36 vertices for an oriented box defined by its 8 corners in world space.
+    ///
+    /// Corner layout (r = right axis, u = up axis, f = forward axis):
+    ///   0: (-r, -u, -f)   "back-bottom-left"
+    ///   1: (+r, -u, -f)   "back-bottom-right"
+    ///   2: (+r, +u, -f)   "back-top-right"
+    ///   3: (-r, +u, -f)   "back-top-left"
+    ///   4: (-r, -u, +f)   "front-bottom-left"
+    ///   5: (+r, -u, +f)   "front-bottom-right"
+    ///   6: (+r, +u, +f)   "front-top-right"
+    ///   7: (-r, +u, +f)   "front-top-left"
+    fn oriented_box(corners: [Vector3<f32>; 8], color: [f32; 3], dark: [f32; 3]) -> Vec<[f32; 6]> {
+        let c = color;
+        let d = dark;
+        // helper to pack a vertex
+        let v = |p: Vector3<f32>, col: [f32; 3]| -> [f32; 6] {
+            [p.x, p.y, p.z, col[0], col[1], col[2]]
+        };
+        let [c0, c1, c2, c3, c4, c5, c6, c7] = corners;
+        // shade each face slightly differently for visibility
+        let front  = c;
+        let back   = d;
+        let top    = [c[0]*0.8, c[1]*0.8, c[2]*0.8];
+        let bottom = [d[0]*0.6, d[1]*0.6, d[2]*0.6];
+        let right  = [c[0]*0.7, c[1]*0.7, c[2]*0.7];
+        let left   = [c[0]*0.9, c[1]*0.9, c[2]*0.9];
+        vec![
+            // Front face  (c4 c5 c6 c7)
+            v(c4,front), v(c5,front), v(c6,front),
+            v(c4,front), v(c6,front), v(c7,front),
+            // Back face   (c1 c0 c3 c2)
+            v(c1,back),  v(c0,back),  v(c3,back),
+            v(c1,back),  v(c3,back),  v(c2,back),
+            // Top face    (c3 c2 c6 c7)  -- note: c2/c3 are back-top, c6/c7 front-top
+            v(c3,top),   v(c2,top),   v(c6,top),
+            v(c3,top),   v(c6,top),   v(c7,top),
+            // Bottom face (c0 c1 c5 c4)
+            v(c0,bottom),v(c1,bottom),v(c5,bottom),
+            v(c0,bottom),v(c5,bottom),v(c4,bottom),
+            // Right face  (c1 c2 c6 c5)
+            v(c1,right), v(c2,right), v(c6,right),
+            v(c1,right), v(c6,right), v(c5,right),
+            // Left face   (c0 c4 c7 c3)
+            v(c0,left),  v(c4,left),  v(c7,left),
+            v(c0,left),  v(c7,left),  v(c3,left),
+        ]
+    }
+
+    /// Build oriented-box corners for a box whose axes are (right, up, fwd) in world space,
+    /// spanning [-hw..+hw] along right, [-hh..+hh] along up, [f0..f1] along fwd,
+    /// all relative to `anchor`.
+    fn box_corners(
+        anchor: Vector3<f32>,
+        right: Vector3<f32>,
+        up: Vector3<f32>,
+        fwd: Vector3<f32>,
+        hw: f32, hh: f32,
+        f0: f32, f1: f32,
+    ) -> [Vector3<f32>; 8] {
+        let p = |r: f32, u: f32, f: f32| anchor + right * r + up * u + fwd * f;
+        [
+            p(-hw, -hh, f0), // 0 back-bottom-left
+            p( hw, -hh, f0), // 1 back-bottom-right
+            p( hw,  hh, f0), // 2 back-top-right
+            p(-hw,  hh, f0), // 3 back-top-left
+            p(-hw, -hh, f1), // 4 front-bottom-left
+            p( hw, -hh, f1), // 5 front-bottom-right
+            p( hw,  hh, f1), // 6 front-top-right
+            p(-hw,  hh, f1), // 7 front-top-left
+        ]
+    }
+
+    /// Build 3D gun vertices positioned in world space relative to the camera,
+    /// so it always appears in the lower-right of the screen like a classic FPS.
+    fn build_gun_verts(camera: &Camera) -> Vec<[f32; 6]> {
+        let fwd   = camera.get_forward_vector().normalize();
+        let right = camera.get_right_vector();
+        let up    = camera.get_up_vector();
+
+        // Gun anchor: slightly in front, to the right, and below the camera
+        let anchor = camera.position
+            + fwd   *  0.6
+            + right *  0.35
+            + up    * -0.28;
+
+        // Dimensions
+        let barrel_hw = 0.03_f32;
+        let barrel_hh = 0.03_f32;
+
+        let body_hw = 0.06_f32;
+        let body_hh = 0.08_f32;
+        let body_len = 0.20_f32;
+
+        let grip_hw     = 0.04_f32;
+        let grip_height = 0.12_f32;
+        let grip_len    = 0.08_f32;
+
+        // Colours
+        let barrel_col : [f32; 3] = [0.25, 0.25, 0.25];
+        let barrel_dark: [f32; 3] = [0.15, 0.15, 0.15];
+        let body_col   : [f32; 3] = [0.35, 0.30, 0.20];
+        let body_dark  : [f32; 3] = [0.20, 0.17, 0.10];
+        let grip_col   : [f32; 3] = [0.20, 0.15, 0.10];
+        let grip_dark  : [f32; 3] = [0.12, 0.09, 0.06];
+
+        // Barrel: centred on anchor, runs forward from f=0 to f=0.55
+        let barrel_corners = Self::box_corners(anchor, right, up, fwd,
+            barrel_hw, barrel_hh, 0.0, 0.55);
+
+        // Body: centred on anchor, runs backward from f=0 to f=-body_len
+        let body_corners = Self::box_corners(anchor, right, up, fwd,
+            body_hw, body_hh, -body_len, 0.0);
+
+        // Grip: hangs below the rear of the body.
+        let grip_anchor = anchor + up * (-body_hh);
+        let grip_corners = Self::box_corners(grip_anchor, right, up, fwd,
+            grip_hw, grip_height * 0.5,
+            -body_len + grip_len * 2.0, -body_len + grip_len * 4.0);
+
+        let mut verts = Vec::new();
+        verts.extend(Self::oriented_box(barrel_corners, barrel_col, barrel_dark));
+        verts.extend(Self::oriented_box(body_corners,   body_col,   body_dark));
+        verts.extend(Self::oriented_box(grip_corners,   grip_col,   grip_dark));
+        verts
+    }
+
+    /// Returns the world-space position of the barrel muzzle — identical offsets to build_gun_verts.
+    fn gun_barrel_tip(camera: &Camera) -> Vector3<f32> {
+        let fwd   = camera.get_forward_vector().normalize();
+        let right = camera.get_right_vector();
+        let up    = camera.get_up_vector();
+        let anchor = camera.position
+            + fwd   *  0.6
+            + right *  0.35
+            + up    * -0.28;
+        // barrel tip = anchor + fwd * 0.55 (the front face of the barrel box)
+        anchor + fwd * 0.55
+    }
+
     fn render(&mut self) {
         let device = self.device.as_ref().unwrap();
-        let queue = self.queue.as_ref().unwrap();
+        let queue  = self.queue.as_ref().unwrap();
         let surface = self.surface.as_ref().unwrap();
-        let pipeline = self.pipeline.as_ref().unwrap();
+        let pipeline   = self.pipeline.as_ref().unwrap();
         let bind_group = self.bind_group.as_ref().unwrap();
         let camera_buffer = self.camera_buffer.as_ref().unwrap();
 
+        // Upload camera matrix
         let vp = self.camera.get_view_projection();
         let vp_arr: [[f32; 4]; 4] = vp.into();
         let vp_flat: [f32; 16] = [
-            vp_arr[0][0],
-            vp_arr[0][1],
-            vp_arr[0][2],
-            vp_arr[0][3],
-            vp_arr[1][0],
-            vp_arr[1][1],
-            vp_arr[1][2],
-            vp_arr[1][3],
-            vp_arr[2][0],
-            vp_arr[2][1],
-            vp_arr[2][2],
-            vp_arr[2][3],
-            vp_arr[3][0],
-            vp_arr[3][1],
-            vp_arr[3][2],
-            vp_arr[3][3],
+            vp_arr[0][0], vp_arr[0][1], vp_arr[0][2], vp_arr[0][3],
+            vp_arr[1][0], vp_arr[1][1], vp_arr[1][2], vp_arr[1][3],
+            vp_arr[2][0], vp_arr[2][1], vp_arr[2][2], vp_arr[2][3],
+            vp_arr[3][0], vp_arr[3][1], vp_arr[3][2], vp_arr[3][3],
         ];
         queue.write_buffer(camera_buffer, 0, bytemuck::cast_slice(&[vp_flat]));
 
-        // Build dynamic geometry for enemies and bullets
+        // Build world geometry
         let mut vertices: Vec<[f32; 6]> = vec![
-            // Floor (blue) - large quad
+            // Floor (blue)
             [-50.0, 0.0, -50.0, 0.0, 0.0, 1.0],
-            [50.0, 0.0, -50.0, 0.0, 0.0, 1.0],
-            [50.0, 0.0, 50.0, 0.0, 0.0, 1.0],
+            [ 50.0, 0.0, -50.0, 0.0, 0.0, 1.0],
+            [ 50.0, 0.0,  50.0, 0.0, 0.0, 1.0],
             [-50.0, 0.0, -50.0, 0.0, 0.0, 1.0],
-            [50.0, 0.0, 50.0, 0.0, 0.0, 1.0],
-            [-50.0, 0.0, 50.0, 0.0, 0.0, 1.0],
+            [ 50.0, 0.0,  50.0, 0.0, 0.0, 1.0],
+            [-50.0, 0.0,  50.0, 0.0, 0.0, 1.0],
         ];
 
-        // Add alive enemies
+        // Alive enemies (red cuboids)
         for enemy in &self.enemies {
-            if !enemy.alive {
-                continue;
-            }
+            if !enemy.alive { continue; }
             let pos = enemy.position;
-            let enemy_verts = vec![
-                // Front
-                [pos.x - 1.0, pos.y - 1.0, pos.z + 1.0, 1.0, 0.0, 0.0],
-                [pos.x + 1.0, pos.y - 1.0, pos.z + 1.0, 1.0, 0.0, 0.0],
-                [pos.x + 1.0, pos.y + 1.0, pos.z + 1.0, 1.0, 0.0, 0.0],
-                [pos.x - 1.0, pos.y - 1.0, pos.z + 1.0, 1.0, 0.0, 0.0],
-                [pos.x + 1.0, pos.y + 1.0, pos.z + 1.0, 1.0, 0.0, 0.0],
-                [pos.x - 1.0, pos.y + 1.0, pos.z + 1.0, 1.0, 0.0, 0.0],
-                // Back
-                [pos.x - 1.0, pos.y - 1.0, pos.z - 1.0, 0.5, 0.0, 0.0],
-                [pos.x - 1.0, pos.y + 1.0, pos.z - 1.0, 0.5, 0.0, 0.0],
-                [pos.x + 1.0, pos.y + 1.0, pos.z - 1.0, 0.5, 0.0, 0.0],
-                [pos.x - 1.0, pos.y - 1.0, pos.z - 1.0, 0.5, 0.0, 0.0],
-                [pos.x + 1.0, pos.y + 1.0, pos.z - 1.0, 0.5, 0.0, 0.0],
-                [pos.x + 1.0, pos.y - 1.0, pos.z - 1.0, 0.5, 0.0, 0.0],
-                // Top
-                [pos.x - 1.0, pos.y + 1.0, pos.z + 1.0, 0.7, 0.0, 0.0],
-                [pos.x + 1.0, pos.y + 1.0, pos.z + 1.0, 0.7, 0.0, 0.0],
-                [pos.x + 1.0, pos.y + 1.0, pos.z - 1.0, 0.7, 0.0, 0.0],
-                [pos.x - 1.0, pos.y + 1.0, pos.z + 1.0, 0.7, 0.0, 0.0],
-                [pos.x + 1.0, pos.y + 1.0, pos.z - 1.0, 0.7, 0.0, 0.0],
-                [pos.x - 1.0, pos.y + 1.0, pos.z - 1.0, 0.7, 0.0, 0.0],
-                // Right
-                [pos.x + 1.0, pos.y - 1.0, pos.z + 1.0, 0.6, 0.0, 0.0],
-                [pos.x + 1.0, pos.y - 1.0, pos.z - 1.0, 0.6, 0.0, 0.0],
-                [pos.x + 1.0, pos.y + 1.0, pos.z - 1.0, 0.6, 0.0, 0.0],
-                [pos.x + 1.0, pos.y - 1.0, pos.z + 1.0, 0.6, 0.0, 0.0],
-                [pos.x + 1.0, pos.y + 1.0, pos.z - 1.0, 0.6, 0.0, 0.0],
-                [pos.x + 1.0, pos.y + 1.0, pos.z + 1.0, 0.6, 0.0, 0.0],
-                // Left
-                [pos.x - 1.0, pos.y - 1.0, pos.z - 1.0, 0.8, 0.0, 0.0],
-                [pos.x - 1.0, pos.y - 1.0, pos.z + 1.0, 0.8, 0.0, 0.0],
-                [pos.x - 1.0, pos.y + 1.0, pos.z + 1.0, 0.8, 0.0, 0.0],
-                [pos.x - 1.0, pos.y - 1.0, pos.z - 1.0, 0.8, 0.0, 0.0],
-                [pos.x - 1.0, pos.y + 1.0, pos.z + 1.0, 0.8, 0.0, 0.0],
-                [pos.x - 1.0, pos.y + 1.0, pos.z - 1.0, 0.8, 0.0, 0.0],
-            ];
-            vertices.extend(enemy_verts);
+            let ev = Self::oriented_box(
+                Self::box_corners(pos, Vector3::unit_x(), Vector3::unit_y(), Vector3::unit_z(),
+                    1.0, 1.0, -1.0, 1.0),
+                [1.0, 0.0, 0.0],
+                [0.5, 0.0, 0.0],
+            );
+            vertices.extend(ev);
         }
 
-        // Add bullets (small yellow cubes)
+        // Bullets (small yellow cuboids)
         for bullet in &self.bullets {
             let pos = bullet.position;
-            let size = 0.1;
-            let bullet_verts = vec![
-                // Front
-                [pos.x - size, pos.y - size, pos.z + size, 1.0, 1.0, 0.0],
-                [pos.x + size, pos.y - size, pos.z + size, 1.0, 1.0, 0.0],
-                [pos.x + size, pos.y + size, pos.z + size, 1.0, 1.0, 0.0],
-                [pos.x - size, pos.y - size, pos.z + size, 1.0, 1.0, 0.0],
-                [pos.x + size, pos.y + size, pos.z + size, 1.0, 1.0, 0.0],
-                [pos.x - size, pos.y + size, pos.z + size, 1.0, 1.0, 0.0],
-                // Back
-                [pos.x - size, pos.y - size, pos.z - size, 0.8, 0.8, 0.0],
-                [pos.x - size, pos.y + size, pos.z - size, 0.8, 0.8, 0.0],
-                [pos.x + size, pos.y + size, pos.z - size, 0.8, 0.8, 0.0],
-                [pos.x - size, pos.y - size, pos.z - size, 0.8, 0.8, 0.0],
-                [pos.x + size, pos.y + size, pos.z - size, 0.8, 0.8, 0.0],
-                [pos.x + size, pos.y - size, pos.z - size, 0.8, 0.8, 0.0],
-                // Top
-                [pos.x - size, pos.y + size, pos.z + size, 0.9, 0.9, 0.0],
-                [pos.x + size, pos.y + size, pos.z + size, 0.9, 0.9, 0.0],
-                [pos.x + size, pos.y + size, pos.z - size, 0.9, 0.9, 0.0],
-                [pos.x - size, pos.y + size, pos.z + size, 0.9, 0.9, 0.0],
-                [pos.x + size, pos.y + size, pos.z - size, 0.9, 0.9, 0.0],
-                [pos.x - size, pos.y + size, pos.z - size, 0.9, 0.9, 0.0],
-                // Bottom
-                [pos.x - size, pos.y - size, pos.z - size, 0.7, 0.7, 0.0],
-                [pos.x + size, pos.y - size, pos.z - size, 0.7, 0.7, 0.0],
-                [pos.x + size, pos.y - size, pos.z + size, 0.7, 0.7, 0.0],
-                [pos.x - size, pos.y - size, pos.z - size, 0.7, 0.7, 0.0],
-                [pos.x + size, pos.y - size, pos.z + size, 0.7, 0.7, 0.0],
-                [pos.x - size, pos.y - size, pos.z + size, 0.7, 0.7, 0.0],
-                // Right
-                [pos.x + size, pos.y - size, pos.z + size, 0.85, 0.85, 0.0],
-                [pos.x + size, pos.y - size, pos.z - size, 0.85, 0.85, 0.0],
-                [pos.x + size, pos.y + size, pos.z - size, 0.85, 0.85, 0.0],
-                [pos.x + size, pos.y - size, pos.z + size, 0.85, 0.85, 0.0],
-                [pos.x + size, pos.y + size, pos.z - size, 0.85, 0.85, 0.0],
-                [pos.x + size, pos.y + size, pos.z + size, 0.85, 0.85, 0.0],
-                // Left
-                [pos.x - size, pos.y - size, pos.z - size, 0.75, 0.75, 0.0],
-                [pos.x - size, pos.y - size, pos.z + size, 0.75, 0.75, 0.0],
-                [pos.x - size, pos.y + size, pos.z + size, 0.75, 0.75, 0.0],
-                [pos.x - size, pos.y - size, pos.z - size, 0.75, 0.75, 0.0],
-                [pos.x - size, pos.y + size, pos.z + size, 0.75, 0.75, 0.0],
-                [pos.x - size, pos.y + size, pos.z - size, 0.75, 0.75, 0.0],
-            ];
-            vertices.extend(bullet_verts);
+            let s = 0.1_f32;
+            let bv = Self::oriented_box(
+                Self::box_corners(pos, Vector3::unit_x(), Vector3::unit_y(), Vector3::unit_z(),
+                    s, s, -s, s),
+                [1.0, 1.0, 0.0],
+                [0.7, 0.7, 0.0],
+            );
+            vertices.extend(bv);
         }
 
-        // Recreate vertex/index buffers with dynamic data
+        // 3D gun cuboids (view-space, attached to camera)
+        let gun_verts = Self::build_gun_verts(&self.camera);
+        vertices.extend(gun_verts);
+
         let vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("Vertex Buffer"),
             contents: bytemuck::cast_slice(&vertices),
@@ -924,12 +710,11 @@ impl App {
         });
 
         let output = surface.get_current_texture().unwrap();
-        let view = output
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
+        let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
 
+        // 3D world pass (floor + enemies + bullets + 3D gun)
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Render Pass"),
@@ -937,12 +722,7 @@ impl App {
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.1,
-                            g: 0.1,
-                            b: 0.2,
-                            a: 1.0,
-                        }),
+                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.1, g: 0.1, b: 0.2, a: 1.0 }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -958,11 +738,11 @@ impl App {
             pass.draw_indexed(0..vertices.len() as u32, 0, 0..1);
         }
 
-        // Render UI (crosshairs only - gun will be rendered separately with texture)
+        // 2D UI pass (crosshair)
         {
-            let ui_pipeline = self.ui_pipeline.as_ref().unwrap();
+            let ui_pipeline      = self.ui_pipeline.as_ref().unwrap();
             let ui_vertex_buffer = self.ui_vertex_buffer.as_ref().unwrap();
-            let ui_index_buffer = self.ui_index_buffer.as_ref().unwrap();
+            let ui_index_buffer  = self.ui_index_buffer.as_ref().unwrap();
 
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("UI Render Pass"),
@@ -982,36 +762,7 @@ impl App {
             pass.set_pipeline(ui_pipeline);
             pass.set_vertex_buffer(0, ui_vertex_buffer.slice(..));
             pass.set_index_buffer(ui_index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-            pass.draw_indexed(0..4, 0, 0..1); // Only 4 vertices for crosshair (removed gun lines)
-        }
-
-        // Render textured gun sprite
-        {
-            let gun_pipeline = self.gun_texture_pipeline.as_ref().unwrap();
-            let gun_bind_group = self.gun_texture_bind_group.as_ref().unwrap();
-            let gun_vertex_buffer = self.gun_vertex_buffer.as_ref().unwrap();
-            let gun_index_buffer = self.gun_index_buffer.as_ref().unwrap();
-
-            let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Gun Texture Render Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                occlusion_query_set: None,
-                timestamp_writes: None,
-            });
-
-            pass.set_pipeline(gun_pipeline);
-            pass.set_bind_group(0, gun_bind_group, &[]);
-            pass.set_vertex_buffer(0, gun_vertex_buffer.slice(..));
-            pass.set_index_buffer(gun_index_buffer.slice(..), wgpu::IndexFormat::Uint16);
-            pass.draw_indexed(0..6, 0, 0..1); // 6 indices for 2 triangles (quad)
+            pass.draw_indexed(0..4, 0, 0..1);
         }
 
         queue.submit([encoder.finish()]);
@@ -1026,22 +777,17 @@ impl ApplicationHandler for App {
                 .create_window(
                     winit::window::Window::default_attributes()
                         .with_title("Simple Quake")
-                        .with_inner_size(winit::dpi::PhysicalSize::new(
-                            WINDOW_WIDTH,
-                            WINDOW_HEIGHT,
-                        )),
+                        .with_inner_size(winit::dpi::PhysicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT)),
                 )
                 .unwrap(),
         );
 
-        // Try to lock cursor for unlimited rotation, fallback to confined mode
         if window.set_cursor_grab(winit::window::CursorGrabMode::Locked).is_err() {
             let _ = window.set_cursor_grab(winit::window::CursorGrabMode::Confined);
             println!("Using confined cursor mode (locked mode not supported)");
         }
         window.set_cursor_visible(false);
 
-        // Center cursor initially
         let center_x = WINDOW_WIDTH as f64 / 2.0;
         let center_y = WINDOW_HEIGHT as f64 / 2.0;
         let _ = window.set_cursor_position(winit::dpi::PhysicalPosition::new(center_x, center_y));
@@ -1055,49 +801,49 @@ impl ApplicationHandler for App {
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
-            WindowEvent::CloseRequested => {
-                event_loop.exit();
-            }
-            WindowEvent::Resized(_) => {
-                // Could resize here
+            WindowEvent::CloseRequested => { event_loop.exit(); }
+            WindowEvent::Resized(new_size) => {
+                let w = new_size.width.max(1);
+                let h = new_size.height.max(1);
+                if let (Some(device), Some(surface), Some(config)) = (
+                    self.device.as_ref(),
+                    self.surface.as_ref(),
+                    self.surface_config.as_mut(),
+                ) {
+                    config.width  = w;
+                    config.height = h;
+                    surface.configure(device, config);
+                }
+                self.camera.aspect = w as f32 / h as f32;
             }
             WindowEvent::RedrawRequested => {
                 self.update();
                 self.render();
             }
             WindowEvent::KeyboardInput {
-                event:
-                    KeyEvent {
-                        physical_key,
-                        state,
-                        ..
-                    },
-                ..
+                event: KeyEvent { physical_key, state, .. }, ..
             } => {
                 let pressed = state == ElementState::Pressed;
                 if let PhysicalKey::Code(code) = physical_key {
                     match code {
-                        KeyCode::KeyW => self.input.forward = pressed,
-                        KeyCode::KeyS => self.input.backward = pressed,
-                        KeyCode::KeyA => self.input.left = pressed,
-                        KeyCode::KeyD => self.input.right = pressed,
+                        KeyCode::KeyW  => self.input.forward   = pressed,
+                        KeyCode::KeyS  => self.input.backward  = pressed,
+                        KeyCode::KeyA  => self.input.left      = pressed,
+                        KeyCode::KeyD  => self.input.right     = pressed,
                         KeyCode::Escape => event_loop.exit(),
                         _ => {}
                     }
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                // On first mouse event, just initialize position without calculating delta
                 if self.input.first_mouse {
                     self.input.last_mouse_x = position.x;
                     self.input.last_mouse_y = position.y;
                     self.input.first_mouse = false;
                 } else {
-                    // Calculate mouse delta
                     let dx = (position.x - self.input.last_mouse_x) as f32;
                     let dy = (position.y - self.input.last_mouse_y) as f32;
 
-                    // Ignore huge jumps (e.g., cursor re-centering or entering window)
                     if dx.abs() < 200.0 && dy.abs() < 200.0 {
                         self.input.mouse_dx = dx;
                         self.input.mouse_dy = dy;
@@ -1106,14 +852,11 @@ impl ApplicationHandler for App {
                     self.input.last_mouse_x = position.x;
                     self.input.last_mouse_y = position.y;
 
-                    // Re-center cursor if it gets too close to edges (for confined mode)
                     let window = self.window.as_ref().unwrap();
                     let center_x = WINDOW_WIDTH as f64 / 2.0;
                     let center_y = WINDOW_HEIGHT as f64 / 2.0;
-                    let dist_from_center = ((position.x - center_x).powi(2) + (position.y - center_y).powi(2)).sqrt();
-
-                    // If cursor is far from center (more than 30% of window size), re-center it
-                    if dist_from_center > (WINDOW_WIDTH as f64 * 0.3) {
+                    let dist = ((position.x - center_x).powi(2) + (position.y - center_y).powi(2)).sqrt();
+                    if dist > (WINDOW_WIDTH as f64 * 0.3) {
                         let _ = window.set_cursor_position(winit::dpi::PhysicalPosition::new(center_x, center_y));
                         self.input.last_mouse_x = center_x;
                         self.input.last_mouse_y = center_y;
@@ -1141,7 +884,6 @@ impl ApplicationHandler for App {
         _device_id: winit::event::DeviceId,
         event: winit::event::DeviceEvent,
     ) {
-        // Handle raw mouse motion for locked cursor mode
         if let winit::event::DeviceEvent::MouseMotion { delta } = event {
             self.input.mouse_dx = delta.0 as f32;
             self.input.mouse_dy = delta.1 as f32;
